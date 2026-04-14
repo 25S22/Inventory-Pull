@@ -1,28 +1,4 @@
-"""
-ETL Script: Hostname Lookup from Resource Inventory
-=====================================================
-Accepts two Excel files:
-  1. Resource Inventory  — master list of all hosts with details
-  2. Verification Sheet  — hostnames to verify (one or more sheets)
-
-Matches hostnames, extracts desired columns, and produces:
-  • A formatted Excel report  (Found rows + Not Found rows + Summary)
-  • An HTML email draft       (open in browser, copy into your mail client)
-
-HOW TO RUN (no arguments needed if FILE paths are set in CONFIG below):
-    python Validator.py
-
-CLI overrides (all optional — they take precedence over CONFIG values):
-    python Validator.py \
-        --inventory   "Resource_Inventory.xlsx" \
-        --verification "Verification.xlsx"      \
-        --output      "Lookup_Results.xlsx"     \
-        --email-draft "email_draft.html"
-
-Edit only the CONFIG block below. Do not touch the code beneath it.
-"""
 import argparse
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +28,8 @@ CONFIG = {
         "Owner",
         "Status",
     ],
-    "inventory_sheet": 0,  # 0 = first sheet, or provide sheet name string
+    # Use 0 for first sheet or sheet name string
+    "inventory_sheet": 0,
 
     # Verification columns
     "verification_hostname_col": "Name",
@@ -78,14 +55,18 @@ CONFIG = {
         "Please find attached the hostname verification report generated from "
         "the latest resource inventory.\n\n"
         "The report contains:\n"
-        "  * Found entries - full inventory details for matched hostnames.\n"
-        "  * Not Found entries - hostnames that could not be located in the current inventory.\n\n"
+        "  * One tab per verification sheet (e.g., AWS, Azure).\n"
+        "  * Each tab shows requested hostnames with matched inventory details.\n"
+        "  * Rows not found in inventory are clearly marked.\n\n"
         "Kindly review and revert with any corrections.\n\n"
         "Regards"
     ),
 
     # If True, attach output report to Outlook draft
     "attach_report_to_email": True,
+
+    # If True, keep a Summary worksheet in Excel output
+    "include_summary_sheet": True,
 }
 # =============================================================================
 #  END OF CONFIGURATION -- do not edit below this line
@@ -143,7 +124,6 @@ def _read_tabular(path: str, sheet_name=0):
 
     if ext == ".csv":
         df = pd.read_csv(path, dtype=str).fillna("")
-        # strip columns for reliability
         df.columns = [str(c).strip() for c in df.columns]
         if sheet_name is None:
             return {"Sheet1": df}
@@ -163,7 +143,7 @@ def _read_tabular(path: str, sheet_name=0):
         data.columns = [str(c).strip() for c in data.columns]
         return data
 
-    # Fallback by content/reader attempt
+    # Fallback attempt
     try:
         df = pd.read_csv(path, dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
@@ -192,7 +172,6 @@ def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
     """Load the inventory sheet/file and validate required columns."""
     inv = _read_tabular(path, sheet_name=cfg["inventory_sheet"])
 
-    # Safety: if a dict is returned unexpectedly, choose configured sheet / first sheet
     if isinstance(inv, dict):
         sheet_key = cfg["inventory_sheet"]
         if isinstance(sheet_key, str) and sheet_key in inv:
@@ -204,15 +183,13 @@ def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
             inv = next(iter(inv.values()))
 
     if not isinstance(inv, pd.DataFrame):
-        print(f"[ERROR] Inventory data is invalid type: {type(inv)}")
+        print(f"[ERROR] Inventory data invalid type: {type(inv)}")
         sys.exit(1)
 
     inv = inv.fillna("")
     inv.columns = [str(c).strip() for c in inv.columns]
 
-    required = list(dict.fromkeys(
-        [cfg["inventory_hostname_col"]] + cfg["inventory_desired_cols"]
-    ))
+    required = list(dict.fromkeys([cfg["inventory_hostname_col"]] + cfg["inventory_desired_cols"]))
     missing = [c for c in required if c not in inv.columns]
     if missing:
         print(
@@ -226,8 +203,8 @@ def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
 
 
 def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
-    """Build a dict: normalised hostname -> list[pd.Series] of matching rows."""
-    lookup: dict = {}
+    """Build dict: normalised hostname -> list of matching inventory rows."""
+    lookup = {}
     key_col = cfg["inventory_hostname_col"]
     ci = cfg["case_insensitive"]
 
@@ -236,27 +213,24 @@ def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
         if key:
             lookup.setdefault(key, []).append(row)
 
-    # soft warning on duplicates
     dup_hosts = [k for k, v in lookup.items() if len(v) > 1]
     if dup_hosts:
-        print(f"[WARNING] {len(dup_hosts)} hostname(s) have duplicates in inventory; all matches will be returned.")
+        print(f"[WARNING] {len(dup_hosts)} duplicate hostname(s) in inventory; all matches will be returned.")
 
     return lookup
 
 
-def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
+def process_verification(vpath: str, cfg: dict, lookup: dict) -> tuple[list, dict]:
     """
-    Walk every requested sheet/file in the verification input.
-    Returns a flat list of result dicts, one dict per output row.
+    Returns:
+      all_results: flat list of all output records
+      per_sheet_results: dict[sheet_name] = list of output records for that sheet
     """
     if cfg["verification_all_sheets"]:
         raw_sheets = _read_tabular(vpath, sheet_name=None)
         sheets = list(raw_sheets.items()) if isinstance(raw_sheets, dict) else [("Sheet1", raw_sheets)]
     else:
-        sheets = [
-            (name, _read_tabular(vpath, sheet_name=name))
-            for name in cfg["verification_sheet_names"]
-        ]
+        sheets = [(name, _read_tabular(vpath, sheet_name=name)) for name in cfg["verification_sheet_names"]]
 
     hn_col = cfg["verification_hostname_col"]
     ci = cfg["case_insensitive"]
@@ -266,7 +240,8 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
     orig_col = cfg["original_value_col_name"]
     status_col = cfg["status_col_name"]
 
-    results = []
+    all_results = []
+    per_sheet_results = {}
 
     for sheet_name, df in sheets:
         if isinstance(df, dict):
@@ -281,6 +256,8 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
             )
             continue
 
+        sheet_rows = []
+
         for _, vrow in df.iterrows():
             raw_val = str(vrow[hn_col]).strip()
             if not raw_val:
@@ -289,30 +266,25 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
             parsed = _parse_hostname(raw_val, cfg["strip_before_at"]).strip()
             key = _normalise(parsed, ci)
 
-            # parsed could become blank after split
-            if not key:
-                record = {src_col: sheet_name, orig_col: raw_val}
-                for col in desired:
-                    record[col] = ""
-                record[status_col] = not_found_msg
-                results.append(record)
-                continue
-
-            if key in lookup:
+            if key and key in lookup:
                 for inv_row in lookup[key]:
                     record = {src_col: sheet_name, orig_col: raw_val}
                     for col in desired:
                         record[col] = inv_row.get(col, "")
                     record[status_col] = "Found"
-                    results.append(record)
+                    sheet_rows.append(record)
+                    all_results.append(record)
             else:
                 record = {src_col: sheet_name, orig_col: raw_val}
                 for col in desired:
                     record[col] = ""
                 record[status_col] = not_found_msg
-                results.append(record)
+                sheet_rows.append(record)
+                all_results.append(record)
 
-    return results
+        per_sheet_results[sheet_name] = sheet_rows
+
+    return all_results, per_sheet_results
 
 
 # =============================================================================
@@ -331,24 +303,24 @@ def _style_sheet(ws, df: pd.DataFrame, found_flags: list, cfg: dict) -> None:
         cell.border = _BORDER
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # Rows
+    # Data rows
     for row_pos, (row_values, is_found) in enumerate(
         zip(df.itertuples(index=False, name=None), found_flags), start=2
     ):
-        base_fill = ((_ALT_ROW_FILL if row_pos % 2 == 0 else _FOUND_FILL) if is_found else _NOTFOUND_FILL)
+        base_fill = (_ALT_ROW_FILL if row_pos % 2 == 0 else _FOUND_FILL) if is_found else _NOTFOUND_FILL
 
         for col_idx, value in enumerate(row_values, start=1):
             cell = ws.cell(row=row_pos, column=col_idx, value=value)
             cell.font = _BOLD_FONT if col_idx == status_col_idx else _CELL_FONT
             cell.border = _BORDER
             cell.alignment = Alignment(vertical="center", wrap_text=False)
-            cell.fill = ((_FOUND_FILL if is_found else _NOTFOUND_FILL) if col_idx == status_col_idx else base_fill)
+            cell.fill = (_FOUND_FILL if is_found else _NOTFOUND_FILL) if col_idx == status_col_idx else base_fill
 
-    # Widths
+    # Auto width
     for col_idx, col_name in enumerate(columns, start=1):
         col_letter = get_column_letter(col_idx)
-        cell_lengths = [len(str(ws.cell(r, col_idx).value or "")) for r in range(2, ws.max_row + 1)]
-        max_len = max([len(str(col_name))] + cell_lengths if cell_lengths else [len(str(col_name))])
+        lengths = [len(str(ws.cell(r, col_idx).value or "")) for r in range(2, ws.max_row + 1)]
+        max_len = max([len(str(col_name))] + lengths if lengths else [len(str(col_name))])
         ws.column_dimensions[col_letter].width = min(max_len + 4, 52)
 
     ws.row_dimensions[1].height = 30
@@ -402,32 +374,48 @@ def _write_summary(ws, df: pd.DataFrame, cfg: dict) -> None:
     ws.column_dimensions["B"].width = 22
 
 
-def write_output_excel(results: list, output_path: str, cfg: dict) -> None:
+def _safe_excel_sheet_name(name: str) -> str:
+    """Excel sheet names: max 31 chars, cannot contain []:*?/\\ and cannot be empty."""
+    s = str(name) if name is not None else "Sheet"
+    for ch in ['[', ']', ':', '*', '?', '/', '\\']:
+        s = s.replace(ch, "_")
+    s = s.strip() or "Sheet"
+    return s[:31]
+
+
+def write_output_excel(results: list, output_path: str, cfg: dict, per_sheet_results: dict) -> None:
     if not results:
         print("[WARNING] No results to write -- output file not created.")
         return
 
-    df = pd.DataFrame(results)
-    found_flags = [r == "Found" for r in df[cfg["status_col_name"]]]
-
     wb = Workbook()
     wb.remove(wb.active)
 
-    ws_all = wb.create_sheet("All Results")
-    _style_sheet(ws_all, df.reset_index(drop=True), found_flags, cfg)
+    # one worksheet per verification sheet
+    for raw_sheet_name, rows in per_sheet_results.items():
+        if not rows:
+            continue
 
-    df_found = df[df[cfg["status_col_name"]] == "Found"].reset_index(drop=True)
-    if not df_found.empty:
-        ws_found = wb.create_sheet("Found")
-        _style_sheet(ws_found, df_found, [True] * len(df_found), cfg)
+        safe_name = _safe_excel_sheet_name(raw_sheet_name)
 
-    df_nf = df[df[cfg["status_col_name"]] != "Found"].reset_index(drop=True)
-    if not df_nf.empty:
-        ws_nf = wb.create_sheet("Not Found")
-        _style_sheet(ws_nf, df_nf, [False] * len(df_nf), cfg)
+        # avoid duplicate sheet names after sanitization
+        final_name = safe_name
+        n = 1
+        while final_name in wb.sheetnames:
+            suffix = f"_{n}"
+            final_name = (safe_name[:31 - len(suffix)] + suffix) if len(safe_name) + len(suffix) > 31 else safe_name + suffix
+            n += 1
 
-    ws_sum = wb.create_sheet("Summary")
-    _write_summary(ws_sum, df, cfg)
+        df_sheet = pd.DataFrame(rows)
+        found_flags = [r == "Found" for r in df_sheet[cfg["status_col_name"]]]
+
+        ws = wb.create_sheet(final_name)
+        _style_sheet(ws, df_sheet.reset_index(drop=True), found_flags, cfg)
+
+    if cfg.get("include_summary_sheet", True):
+        df_all = pd.DataFrame(results)
+        ws_sum = wb.create_sheet("Summary")
+        _write_summary(ws_sum, df_all, cfg)
 
     wb.save(output_path)
     print(f"[OK] Report saved         -> {output_path}")
@@ -438,23 +426,21 @@ def write_output_excel(results: list, output_path: str, cfg: dict) -> None:
 # =============================================================================
 
 def create_outlook_draft(output_excel: str, results: list, cfg: dict) -> None:
-    """
-    Create an Outlook draft email via win32com.client and optionally attach report.
-    """
+    """Create Outlook draft email directly (saved in Drafts)."""
     try:
         import win32com.client  # pywin32
     except ImportError:
-        print("[ERROR] pywin32 is not installed. Run: pip install pywin32")
+        print("[ERROR] pywin32 is not installed. Install with: pip install pywin32")
         return
 
     status_col = cfg["status_col_name"]
     found = sum(1 for r in results if r[status_col] == "Found")
     nf = len(results) - found
-    total = found + nf
+    total = len(results)
 
     body_html = cfg["email_body"].replace("\n", "<br>")
     summary_html = (
-        f"<br><br><b>Run Summary:</b>"
+        "<br><br><b>Run Summary:</b>"
         f"<br>Found: {found}"
         f"<br>Not Found: {nf}"
         f"<br>Total: {total}"
@@ -464,7 +450,7 @@ def create_outlook_draft(output_excel: str, results: list, cfg: dict) -> None:
 
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)  # 0 = olMailItem
+        mail = outlook.CreateItem(0)  # olMailItem
 
         mail.To = cfg["email_to"]
         mail.CC = cfg["email_cc"]
@@ -472,14 +458,14 @@ def create_outlook_draft(output_excel: str, results: list, cfg: dict) -> None:
         mail.HTMLBody = html
 
         if cfg.get("attach_report_to_email", True):
-            if Path(output_excel).is_file():
-                mail.Attachments.Add(str(Path(output_excel).resolve()))
+            report_path = Path(output_excel).resolve()
+            if report_path.is_file():
+                mail.Attachments.Add(str(report_path))
             else:
-                print(f"[WARNING] Attachment file not found: {output_excel}")
+                print(f"[WARNING] Attachment not found: {report_path}")
 
-        # Save to Drafts (not sent)
-        mail.Save()
-        print("[OK] Outlook draft created and saved in Drafts.")
+        mail.Save()  # saves to Drafts
+        print("[OK] Outlook draft created -> Drafts folder")
     except Exception as e:
         print(f"[ERROR] Failed to create Outlook draft: {e}")
 
@@ -519,7 +505,6 @@ def main() -> None:
     verification_path = args.verification
     output_path = args.output
 
-    # Validate input files
     errors = []
     for fpath, label in [
         (inventory_path, "Inventory"),
@@ -527,6 +512,7 @@ def main() -> None:
     ]:
         if not Path(fpath).is_file():
             errors.append(f"  [{label}] File not found: {fpath}")
+
     if errors:
         print("\n[ERROR] Cannot start -- input file(s) missing:")
         print("\n".join(errors))
@@ -534,13 +520,13 @@ def main() -> None:
         sys.exit(1)
 
     print()
-    print("=" * 46)
+    print("=" * 52)
     print("  ETL Hostname Lookup")
-    print("=" * 46)
+    print("=" * 52)
     print(f"  Inventory    : {inventory_path}")
     print(f"  Verification : {verification_path}")
     print(f"  Output       : {output_path}")
-    print("=" * 46)
+    print("=" * 52)
     print()
 
     print("[1/4] Loading resource inventory ...")
@@ -552,13 +538,13 @@ def main() -> None:
     print(f"      {len(lookup):,} unique hostnames indexed.")
 
     print("[3/4] Processing verification sheet(s) ...")
-    results = process_verification(verification_path, cfg, lookup)
+    results, per_sheet_results = process_verification(verification_path, cfg, lookup)
     found = sum(1 for r in results if r[cfg["status_col_name"]] == "Found")
     nf = len(results) - found
     print(f"      {len(results):,} rows -> {found:,} found, {nf:,} not found.")
 
     print("[4/4] Writing outputs ...")
-    write_output_excel(results, output_path, cfg)
+    write_output_excel(results, output_path, cfg, per_sheet_results)
     create_outlook_draft(output_path, results, cfg)
 
     print()
