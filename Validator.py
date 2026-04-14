@@ -85,6 +85,7 @@ _BOLD_FONT = Font(name="Arial", bold=True, size=10)
 
 _THIN = Side(style="thin", color="BDBDBD")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+DUPLICATE_HOST_SAMPLE_SIZE = 10
 
 
 # =============================================================================
@@ -220,8 +221,8 @@ def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
             lookup[key] = row
 
     if dup_count:
-        host_sample = ", ".join(sorted(dup_hosts)[:10])
-        if len(dup_hosts) > 10:
+        host_sample = ", ".join(sorted(dup_hosts)[:DUPLICATE_HOST_SAMPLE_SIZE])
+        if len(dup_hosts) > DUPLICATE_HOST_SAMPLE_SIZE:
             host_sample += ", ..."
         print(
             f"[WARNING] Found {dup_count} duplicate inventory row(s) by hostname; "
