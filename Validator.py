@@ -27,15 +27,15 @@ Edit only the CONFIG block below. Do not touch the code beneath it.
 # =============================================================================
 CONFIG = {
 
-    # ── File paths ────────────────────────────────────────────────────────────
+    # ── File paths ─────────────────────────────────────────────────────────────
     # Set these so you can run the script with no command-line arguments.
     # CLI flags (--inventory, --verification, --output, --email-draft) will
     # override these values if provided.
 
-    # Path to the Resource Inventory Excel file.
+    # Path to the Resource Inventory file (.xlsx/.xls/.csv supported).
     "inventory_file": "Resource_Inventory.xlsx",
 
-    # Path to the Verification Excel file (may contain multiple sheets).
+    # Path to the Verification file (Excel may contain multiple sheets; CSV supported).
     "verification_file": "Verification.xlsx",
 
     # Where to write the output report Excel.
@@ -60,7 +60,7 @@ CONFIG = {
         "Status",
     ],
 
-    # Which sheet inside the inventory file to read.
+    # Which sheet inside the inventory file to read (Excel only).
     # Use 0 for the first sheet, or a sheet name string e.g. "Inventory".
     "inventory_sheet": 0,
 
@@ -170,13 +170,51 @@ def _email_draft_path(output_path: str, explicit: str) -> str:
     return str(p.with_name(p.stem + "_email_draft.html"))
 
 
+def _read_tabular(path: str, sheet_name=0):
+    """
+    Read either Excel or CSV safely.
+
+    Supported:
+      - Excel: .xlsx .xls .xlsm .xlsb .ods
+      - CSV:   .csv
+
+    Behavior:
+      - If sheet_name is None:
+          * Excel -> dict[sheet_name, DataFrame]
+          * CSV   -> {"Sheet1": DataFrame}
+      - Else:
+          * returns single DataFrame
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+
+    if ext == ".csv":
+        df = pd.read_csv(path, dtype=str).fillna("")
+        if sheet_name is None:
+            return {"Sheet1": df}
+        return df
+
+    excel_exts = {".xlsx", ".xls", ".xlsm", ".xlsb", ".ods"}
+    if ext in excel_exts:
+        return pd.read_excel(path, sheet_name=sheet_name, dtype=str).fillna("")
+
+    # Fallback by content/reader attempt
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+        if sheet_name is None:
+            return {"Sheet1": df}
+        return df
+    except Exception:
+        return pd.read_excel(path, sheet_name=sheet_name, dtype=str).fillna("")
+
+
 # =============================================================================
 #  ETL steps
 # =============================================================================
 
 def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
-    """Load the inventory sheet and validate that all required columns exist."""
-    inv = pd.read_excel(path, sheet_name=cfg["inventory_sheet"], dtype=str).fillna("")
+    """Load the inventory sheet/file and validate required columns."""
+    inv = _read_tabular(path, sheet_name=cfg["inventory_sheet"])
 
     # Deduplicate: hostname col must not be checked twice if it also appears
     # in inventory_desired_cols (avoids confusing double-error messages).
@@ -209,15 +247,15 @@ def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
 
 def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
     """
-    Walk every requested sheet in the verification file.
+    Walk every requested sheet/file in the verification input.
     Returns a flat list of result dicts, one dict per output row.
     """
     if cfg["verification_all_sheets"]:
-        raw_sheets = pd.read_excel(vpath, sheet_name=None, dtype=str)
+        raw_sheets = _read_tabular(vpath, sheet_name=None)
         sheets = list(raw_sheets.items())
     else:
         sheets = [
-            (name, pd.read_excel(vpath, sheet_name=name, dtype=str))
+            (name, _read_tabular(vpath, sheet_name=name))
             for name in cfg["verification_sheet_names"]
         ]
 
@@ -272,11 +310,6 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
 def _style_sheet(ws, df: pd.DataFrame, found_flags: list, cfg: dict) -> None:
     """
     Write df into ws with full formatting.
-
-    found_flags is a plain Python list[bool] aligned positionally with df's
-    rows (index 0 = first row, etc.).  Using a positional list — instead of
-    pandas .loc — eliminates the index-mismatch KeyError that occurred on the
-    Found / Not Found sub-sheets in the original code.
     """
     columns = list(df.columns)
     status_col_idx = columns.index(cfg["status_col_name"]) + 1   # 1-based
@@ -303,14 +336,13 @@ def _style_sheet(ws, df: pd.DataFrame, found_flags: list, cfg: dict) -> None:
             cell.font      = _BOLD_FONT if col_idx == status_col_idx else _CELL_FONT
             cell.border    = _BORDER
             cell.alignment = Alignment(vertical="center", wrap_text=False)
-            # Status column always gets its own semantic colour
             cell.fill = (
                 (_FOUND_FILL if is_found else _NOTFOUND_FILL)
                 if col_idx == status_col_idx
                 else base_fill
             )
 
-    # Auto column widths — safe even when there are zero data rows
+    # Auto column widths
     for col_idx, col_name in enumerate(columns, start=1):
         col_letter   = get_column_letter(col_idx)
         cell_lengths = [
@@ -375,31 +407,24 @@ def write_output_excel(results: list, output_path: str, cfg: dict) -> None:
         return
 
     df = pd.DataFrame(results)
-    # Build positional found_flags once; reuse for all sheets
     found_flags = [r == "Found" for r in df[cfg["status_col_name"]]]
 
     wb = Workbook()
-    wb.remove(wb.active)      # discard the default blank sheet
+    wb.remove(wb.active)
 
-    # Sheet 1: All Results
     ws_all = wb.create_sheet("All Results")
     _style_sheet(ws_all, df.reset_index(drop=True), found_flags, cfg)
 
-    # Sheet 2: Found Only
-    # All rows in this subset are found, so found_flags = all True
     df_found = df[df[cfg["status_col_name"]] == "Found"].reset_index(drop=True)
     if not df_found.empty:
         ws_found = wb.create_sheet("Found")
         _style_sheet(ws_found, df_found, [True] * len(df_found), cfg)
 
-    # Sheet 3: Not Found Only
-    # All rows in this subset are not found, so found_flags = all False
     df_nf = df[df[cfg["status_col_name"]] != "Found"].reset_index(drop=True)
     if not df_nf.empty:
         ws_nf = wb.create_sheet("Not Found")
         _style_sheet(ws_nf, df_nf, [False] * len(df_nf), cfg)
 
-    # Sheet 4: Summary
     ws_sum = wb.create_sheet("Summary")
     _write_summary(ws_sum, df, cfg)
 
@@ -476,12 +501,12 @@ def parse_args(cfg: dict) -> argparse.Namespace:
     p.add_argument(
         "--inventory",
         default=cfg["inventory_file"],
-        help="Path to the Resource Inventory Excel file.",
+        help="Path to the Resource Inventory file (.xlsx/.xls/.csv).",
     )
     p.add_argument(
         "--verification",
         default=cfg["verification_file"],
-        help="Path to the Verification Excel file.",
+        help="Path to the Verification file (.xlsx/.xls/.csv).",
     )
     p.add_argument(
         "--output",
