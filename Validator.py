@@ -10,10 +10,10 @@ Matches hostnames, extracts desired columns, and produces:
   • An HTML email draft       (open in browser, copy into your mail client)
 
 HOW TO RUN (no arguments needed if FILE paths are set in CONFIG below):
-    python etl_hostname_lookup.py
+    python Validator.py
 
 CLI overrides (all optional — they take precedence over CONFIG values):
-    python etl_hostname_lookup.py \
+    python Validator.py \
         --inventory   "Resource_Inventory.xlsx" \
         --verification "Verification.xlsx"      \
         --output      "Lookup_Results.xlsx"     \
@@ -42,6 +42,7 @@ CONFIG = {
         "Owner",
         "Status",
     ],
+    # Use 0 for first sheet or sheet name string
     "inventory_sheet": 0,
 
     # Verification columns
@@ -49,7 +50,7 @@ CONFIG = {
     "verification_all_sheets": True,
     "verification_sheet_names": ["Sheet1", "Sheet2"],
 
-    # Matching behaviour
+    # Matching behavior
     "strip_before_at": True,
     "case_insensitive": True,
 
@@ -89,6 +90,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
 
 # Style constants
 _HEADER_FILL = PatternFill("solid", fgColor="1F3864")
@@ -149,22 +151,54 @@ def _read_tabular(path: str, sheet_name=0):
 
     if ext == ".csv":
         df = pd.read_csv(path, dtype=str).fillna("")
-        if sheet_name is None:
-            return {"Sheet1": df}
-        return df
+        return {"Sheet1": df} if sheet_name is None else df
 
     excel_exts = {".xlsx", ".xls", ".xlsm", ".xlsb", ".ods"}
     if ext in excel_exts:
-        return pd.read_excel(path, sheet_name=sheet_name, dtype=str).fillna("")
+        data = pd.read_excel(path, sheet_name=sheet_name, dtype=str)
+        if isinstance(data, dict):
+            return {k: v.fillna("") for k, v in data.items()}
+        return data.fillna("")
 
     # Fallback by content/reader attempt
     try:
         df = pd.read_csv(path, dtype=str).fillna("")
-        if sheet_name is None:
-            return {"Sheet1": df}
-        return df
+        return {"Sheet1": df} if sheet_name is None else df
     except Exception:
-        return pd.read_excel(path, sheet_name=sheet_name, dtype=str).fillna("")
+        data = pd.read_excel(path, sheet_name=sheet_name, dtype=str)
+        if isinstance(data, dict):
+            return {k: v.fillna("") for k, v in data.items()}
+        return data.fillna("")
+
+
+def _ensure_dataframe(data, sheet_selector=0, context_label="file") -> pd.DataFrame:
+    """
+    Ensure returned object is a DataFrame.
+    If dict[sheet_name, DataFrame], select configured sheet or first available.
+    """
+    if isinstance(data, pd.DataFrame):
+        return data.fillna("")
+
+    if isinstance(data, dict):
+        if not data:
+            raise ValueError(f"No sheets found in {context_label}.")
+
+        # sheet by name
+        if isinstance(sheet_selector, str) and sheet_selector in data:
+            return data[sheet_selector].fillna("")
+
+        # sheet by index
+        if isinstance(sheet_selector, int):
+            keys = list(data.keys())
+            if 0 <= sheet_selector < len(keys):
+                return data[keys[sheet_selector]].fillna("")
+            # graceful fallback to first sheet
+            return data[keys[0]].fillna("")
+
+        # fallback to first sheet
+        return next(iter(data.values())).fillna("")
+
+    raise TypeError(f"Expected DataFrame or dict of DataFrames, got: {type(data)}")
 
 
 # =============================================================================
@@ -173,7 +207,8 @@ def _read_tabular(path: str, sheet_name=0):
 
 def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
     """Load the inventory sheet/file and validate required columns."""
-    inv = _read_tabular(path, sheet_name=cfg["inventory_sheet"])
+    raw_inv = _read_tabular(path, sheet_name=cfg["inventory_sheet"])
+    inv = _ensure_dataframe(raw_inv, cfg["inventory_sheet"], context_label=f"inventory file '{path}'")
 
     # Deduplicate: hostname col must not be checked twice if it also appears
     # in inventory_desired_cols (avoids confusing double-error messages).
@@ -211,12 +246,18 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> list:
     """
     if cfg["verification_all_sheets"]:
         raw_sheets = _read_tabular(vpath, sheet_name=None)
-        sheets = list(raw_sheets.items())
+        if isinstance(raw_sheets, pd.DataFrame):
+            sheets = [("Sheet1", raw_sheets.fillna(""))]
+        elif isinstance(raw_sheets, dict):
+            sheets = [(name, df.fillna("")) for name, df in raw_sheets.items()]
+        else:
+            raise TypeError(f"Unexpected verification data type: {type(raw_sheets)}")
     else:
-        sheets = [
-            (name, _read_tabular(vpath, sheet_name=name))
-            for name in cfg["verification_sheet_names"]
-        ]
+        sheets = []
+        for name in cfg["verification_sheet_names"]:
+            one = _read_tabular(vpath, sheet_name=name)
+            df = _ensure_dataframe(one, name, context_label=f"verification file '{vpath}'")
+            sheets.append((name, df))
 
     hn_col = cfg["verification_hostname_col"]
     ci = cfg["case_insensitive"]
