@@ -208,19 +208,24 @@ def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
     key_col = cfg["inventory_hostname_col"]
     ci = cfg["case_insensitive"]
     dup_count = 0
+    dup_hosts = set()
 
     for _, row in inv.iterrows():
         key = _normalise(row.get(key_col, ""), ci)
         if key:
             if key in lookup:
                 dup_count += 1
+                dup_hosts.add(key)
                 continue
             lookup[key] = row
 
     if dup_count:
+        host_sample = ", ".join(sorted(dup_hosts)[:10])
+        if len(dup_hosts) > 10:
+            host_sample += ", ..."
         print(
             f"[WARNING] Found {dup_count} duplicate inventory row(s) by hostname; "
-            "using first match per hostname."
+            f"using first match per hostname. Duplicate hostnames: {host_sample}"
         )
 
     return lookup
