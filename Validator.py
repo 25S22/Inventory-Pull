@@ -85,6 +85,7 @@ _BOLD_FONT = Font(name="Arial", bold=True, size=10)
 
 _THIN = Side(style="thin", color="BDBDBD")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+DUPLICATE_HOST_SAMPLE_SIZE = 10
 
 
 # =============================================================================
@@ -203,19 +204,30 @@ def load_inventory(path: str, cfg: dict) -> pd.DataFrame:
 
 
 def build_lookup(inv: pd.DataFrame, cfg: dict) -> dict:
-    """Build dict: normalised hostname -> list of matching inventory rows."""
+    """Build dict: normalised hostname -> first matching inventory row."""
     lookup = {}
     key_col = cfg["inventory_hostname_col"]
     ci = cfg["case_insensitive"]
+    dup_count = 0
+    dup_hosts = set()
 
     for _, row in inv.iterrows():
         key = _normalise(row.get(key_col, ""), ci)
         if key:
-            lookup.setdefault(key, []).append(row)
+            if key in lookup:
+                dup_count += 1
+                dup_hosts.add(key)
+                continue
+            lookup[key] = row
 
-    dup_hosts = [k for k, v in lookup.items() if len(v) > 1]
-    if dup_hosts:
-        print(f"[WARNING] {len(dup_hosts)} duplicate hostname(s) in inventory; all matches will be returned.")
+    if dup_count:
+        host_sample = ", ".join(sorted(dup_hosts)[:DUPLICATE_HOST_SAMPLE_SIZE])
+        if len(dup_hosts) > DUPLICATE_HOST_SAMPLE_SIZE:
+            host_sample += ", ..."
+        print(
+            f"[WARNING] Found {dup_count} duplicate inventory row(s) by hostname; "
+            f"using first match per hostname. Duplicate hostnames: {host_sample}"
+        )
 
     return lookup
 
@@ -267,13 +279,13 @@ def process_verification(vpath: str, cfg: dict, lookup: dict) -> tuple[list, dic
             key = _normalise(parsed, ci)
 
             if key and key in lookup:
-                for inv_row in lookup[key]:
-                    record = {src_col: sheet_name, orig_col: raw_val}
-                    for col in desired:
-                        record[col] = inv_row.get(col, "")
-                    record[status_col] = "Found"
-                    sheet_rows.append(record)
-                    all_results.append(record)
+                inv_row = lookup[key]
+                record = {src_col: sheet_name, orig_col: raw_val}
+                for col in desired:
+                    record[col] = inv_row.get(col, "")
+                record[status_col] = "Found"
+                sheet_rows.append(record)
+                all_results.append(record)
             else:
                 record = {src_col: sheet_name, orig_col: raw_val}
                 for col in desired:
